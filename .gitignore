@@ -1,0 +1,11 @@
+data/*
+outputs/*
+wandb/*
+pycache/*
+.venv/*
+__pycache__/*
+*.pyc
+adam_atan2_src/*
+checkpoints/*
+logs/*
+runs/*  

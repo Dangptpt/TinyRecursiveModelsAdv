@@ -101,3 +101,73 @@ class ACTLossHead(nn.Module):
 
         return new_carry, lm_loss + 0.5 * (q_halt_loss + q_continue_loss), metrics, detached_outputs, new_carry.halted.all()
 
+
+def make_real_soft_distribution(targets: torch.Tensor, vocab_size: int, noise_std: float = 1.0) -> torch.Tensor:
+
+    safe_targets = targets.clamp(min=0).long()
+    x_real = F.one_hot(safe_targets, num_classes=vocab_size).float()   
+    x_real = x_real + torch.randn_like(x_real) * noise_std + noise_std  
+    x_real = torch.softmax(x_real, dim=-1)
+    return x_real
+
+
+class ACTWGANLossHead(nn.Module):
+
+    def __init__(self, model: nn.Module, loss_type: str):
+        super().__init__()
+        self.model = model
+        self.loss_fn = globals()[loss_type]
+
+    def initial_carry(self, *args, **kwargs):
+        return self.model.initial_carry(*args, **kwargs)  # type: ignore
+
+    def forward(
+        self,
+        return_keys: Sequence[str],
+        **model_kwargs,
+    ) -> Tuple[Any, torch.Tensor, Dict[str, torch.Tensor], Optional[Dict[str, torch.Tensor]], torch.Tensor]:
+        new_carry, outputs = self.model(**model_kwargs)
+        labels = new_carry.current_data["labels"]
+
+        with torch.no_grad():
+            outputs["preds"] = torch.argmax(outputs["logits"], dim=-1)
+            mask = (labels != IGNORE_LABEL_ID)
+            loss_counts = mask.sum(-1)
+            loss_divisor = loss_counts.clamp_min(1).unsqueeze(-1)
+
+            is_correct = mask & (torch.argmax(outputs["logits"], dim=-1) == labels)
+            seq_is_correct = is_correct.sum(-1) == loss_counts
+
+            valid_metrics = new_carry.halted & (loss_counts > 0)
+            metrics = {
+                "count":         valid_metrics.sum(),
+                "accuracy":      torch.where(valid_metrics, (is_correct.to(torch.float32) / loss_divisor).sum(-1), 0).sum(),
+                "exact_accuracy": (valid_metrics & seq_is_correct).sum(),
+                "q_halt_accuracy": (valid_metrics & ((outputs["q_halt_logits"] >= 0) == seq_is_correct)).sum(),
+                "steps":         torch.where(valid_metrics, new_carry.steps, 0).sum(),
+            }
+
+        lm_loss = (self.loss_fn(outputs["logits"], labels, ignore_index=IGNORE_LABEL_ID, valid_mask=mask) / loss_divisor).sum()
+        q_halt_loss = F.binary_cross_entropy_with_logits(
+            outputs["q_halt_logits"], seq_is_correct.to(outputs["q_halt_logits"].dtype), reduction="sum"
+        )
+        metrics.update({"lm_loss": lm_loss.detach(), "q_halt_loss": q_halt_loss.detach()})
+
+        q_continue_loss = 0
+        if "target_q_continue" in outputs:
+            q_continue_loss = F.binary_cross_entropy_with_logits(
+                outputs["q_continue_logits"], outputs["target_q_continue"], reduction="sum"
+            )
+            metrics["q_continue_loss"] = q_continue_loss.detach()
+
+        total_lm_loss = lm_loss + 0.5 * (q_halt_loss + q_continue_loss)
+
+        detached_outputs: Dict[str, torch.Tensor] = {}
+        for k in return_keys:
+            if k == "logits_with_grad":
+                detached_outputs["logits_with_grad"] = outputs["logits"]
+            elif k in outputs:
+                detached_outputs[k] = outputs[k].detach()
+
+        return new_carry, total_lm_loss, metrics, detached_outputs, new_carry.halted.all()
+

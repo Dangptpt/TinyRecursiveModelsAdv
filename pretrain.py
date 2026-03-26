@@ -13,6 +13,7 @@ from torch.utils.data import DataLoader
 
 import tqdm
 import wandb
+from torch.utils.tensorboard import SummaryWriter
 import coolname
 import hydra
 import pydantic
@@ -585,10 +586,13 @@ def launch(hydra_config: DictConfig):
     # Progress bar and logger
     progress_bar = None
     ema_helper = None
+    writer = None
     if RANK == 0:
         progress_bar = tqdm.tqdm(total=train_state.total_steps)
         wandb.init(project=config.project_name, name=config.run_name, config=config.model_dump(), settings=wandb.Settings(_disable_stats=True))  # type: ignore
         wandb.log({"num_params": sum(x.numel() for x in train_state.model.parameters())}, step=0)
+        writer = SummaryWriter(log_dir=os.path.join("runs", config.run_name or "tensorboard-logs"))
+        writer.add_scalar("num_params", sum(x.numel() for x in train_state.model.parameters()), 0)
         save_code_and_config(config)
     if config.ema:
         print('Setup EMA')
@@ -608,6 +612,9 @@ def launch(hydra_config: DictConfig):
 
             if RANK == 0 and metrics is not None:
                 wandb.log(metrics, step=train_state.step)
+                if writer is not None:
+                    for k, v in metrics.items():
+                        writer.add_scalar(k, v, train_state.step)
                 progress_bar.update(train_state.step - progress_bar.n)  # type: ignore
             if config.ema:
                 ema_helper.update(train_state.model)
@@ -634,6 +641,13 @@ def launch(hydra_config: DictConfig):
 
             if RANK == 0 and metrics is not None:
                 wandb.log(metrics, step=train_state.step)
+                if writer is not None:
+                    for k, v in metrics.items():
+                        if isinstance(v, dict):
+                            for sub_k, sub_v in v.items():
+                                writer.add_scalar(f"eval/{k}_{sub_k}", sub_v, train_state.step)
+                        else:
+                            writer.add_scalar(f"eval/{k}", v, train_state.step)
                 
             ############ Checkpointing
             if RANK == 0:
@@ -648,6 +662,8 @@ def launch(hydra_config: DictConfig):
     if dist.is_initialized():
         dist.destroy_process_group()
     wandb.finish()
+    if 'writer' in locals() and writer is not None:
+        writer.close()
 
 
 if __name__ == "__main__":
